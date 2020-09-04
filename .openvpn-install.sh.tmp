@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ACE Autocompletion demo</title>
+  <style type="text/css" media="screen">
+    body {
+        overflow: hidden;
+    }
+    
+    #editor { 
+        margin: 0;
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        right: 0;
+    }
+  </style>
+</head>
+<body>
+<pre id="editor">#!/bin/bash
+# OpenVPN road warrior installer for Debian, Ubuntu and CentOS
+
+# This script will work on Debian, Ubuntu, CentOS and probably other distros
+# of the same families, although no support is offered for them. It isn't
+# bulletproof but it will probably work if you simply want to setup a VPN on
+# your Debian/Ubuntu/CentOS box. It has been designed to be as unobtrusive and
+# universal as possible.
+
+
+if [[ &quot;$EUID&quot; -ne 0 ]]; then
+	echo &quot;Sorry, you need to run this as root&quot;
+	exit 1
+fi
+
+
+if [[ ! -e /dev/net/tun ]]; then
+	echo &quot;TUN is not available&quot;
+	exit 2
+fi
+
+
+if grep -qs &quot;CentOS release 5&quot; &quot;/etc/redhat-release&quot;; then
+	echo &quot;CentOS 5 is too old and not supported&quot;
+	exit 3
+fi
+
+if [[ -e /etc/debian_version ]]; then
+	OS=debian
+	RCLOCAL='/etc/rc.local'
+elif [[ -e /etc/centos-release || -e /etc/redhat-release ]]; then
+	OS=centos
+	RCLOCAL='/etc/rc.d/rc.local'
+	# Needed for CentOS 7
+	chmod +x /etc/rc.d/rc.local
+else
+	echo &quot;Looks like you aren't running this installer on a Debian, Ubuntu or CentOS system&quot;
+	exit 4
+fi
+
+newclient () {
+	# Generates the custom client.ovpn
+	cp /etc/openvpn/client-common.txt ~/$1.ovpn
+	echo &quot;&lt;ca&gt;&quot; &gt;&gt; ~/$1.ovpn
+	cat /etc/openvpn/easy-rsa/pki/ca.crt &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;/ca&gt;&quot; &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;cert&gt;&quot; &gt;&gt; ~/$1.ovpn
+	cat /etc/openvpn/easy-rsa/pki/issued/$1.crt &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;/cert&gt;&quot; &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;key&gt;&quot; &gt;&gt; ~/$1.ovpn
+	cat /etc/openvpn/easy-rsa/pki/private/$1.key &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;/key&gt;&quot; &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;tls-auth&gt;&quot; &gt;&gt; ~/$1.ovpn
+	cat /etc/openvpn/easy-rsa/ta.key &gt;&gt; ~/$1.ovpn
+	echo &quot;&lt;/tls-auth&gt;&quot; &gt;&gt; ~/$1.ovpn
+}
+
+
+# Try to get our IP from the system and fallback to the Internet.
+# I do this to make the script compatible with NATed servers (lowendspirit.com)
+# and to avoid getting an IPv6.
+IP=$(ip addr | grep 'inet' | grep -v inet6 | grep -vE '127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -o -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+if [[ &quot;$IP&quot; = &quot;&quot; ]]; then
+		IP=$(wget -qO- ipv4.icanhazip.com)
+fi
+
+
+if [[ -e /etc/openvpn/server.conf ]]; then
+	while :
+	do
+	clear
+		echo &quot;Looks like OpenVPN is already installed&quot;
+		echo &quot;&quot;
+		echo &quot;What do you want to do?&quot;
+		echo &quot;   1) Add a cert for a new user&quot;
+		echo &quot;   2) Revoke existing user cert&quot;
+		echo &quot;   3) Remove OpenVPN&quot;
+		echo &quot;   4) Exit&quot;
+		read -p &quot;Select an option [1-4]: &quot; option
+		case $option in
+			1) 
+			echo &quot;&quot;
+			echo &quot;Tell me a name for the client cert&quot;
+			echo &quot;Please, use one word only, no special characters&quot;
+			read -p &quot;Client name: &quot; -e -i client CLIENT
+			cd /etc/openvpn/easy-rsa/
+			./easyrsa build-client-full $CLIENT nopass
+			# Generates the custom client.ovpn
+			newclient &quot;$CLIENT&quot;
+			echo &quot;&quot;
+			echo &quot;Client $CLIENT added, certs available at ~/$CLIENT.ovpn&quot;
+			exit
+			;;
+			2)
+			# This option could be documented a bit better and maybe even be simplimplified
+			# ...but what can I say, I want some sleep too
+			NUMBEROFCLIENTS=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep -c &quot;^V&quot;)
+			if [[ &quot;$NUMBEROFCLIENTS&quot; = '0' ]]; then
+				echo &quot;&quot;
+				echo &quot;You have no existing clients!&quot;
+				exit 5
+			fi
+			echo &quot;&quot;
+			echo &quot;Select the existing client certificate you want to revoke&quot;
+			tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep &quot;^V&quot; | cut -d '=' -f 2 | nl -s ') '
+			if [[ &quot;$NUMBEROFCLIENTS&quot; = '1' ]]; then
+				read -p &quot;Select one client [1]: &quot; CLIENTNUMBER
+			else
+				read -p &quot;Select one client [1-$NUMBEROFCLIENTS]: &quot; CLIENTNUMBER
+			fi
+			CLIENT=$(tail -n +2 /etc/openvpn/easy-rsa/pki/index.txt | grep &quot;^V&quot; | cut -d '=' -f 2 | sed -n &quot;$CLIENTNUMBER&quot;p)
+			cd /etc/openvpn/easy-rsa/
+			./easyrsa --batch revoke $CLIENT
+			./easyrsa gen-crl
+			rm -rf pki/reqs/$CLIENT.req
+			rm -rf pki/private/$CLIENT.key
+			rm -rf pki/issued/$CLIENT.crt
+			rm -rf /etc/openvpn/crl.pem
+			cp /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn/crl.pem
+			echo &quot;&quot;
+			echo &quot;Certificate for client $CLIENT revoked&quot;
+			exit
+			;;
+			3) 
+			echo &quot;&quot;
+			read -p &quot;Do you really want to remove OpenVPN? [y/n]: &quot; -e -i n REMOVE
+			if [[ &quot;$REMOVE&quot; = 'y' ]]; then
+				PORT=$(grep '^port ' /etc/openvpn/server.conf | cut -d &quot; &quot; -f 2)
+				if pgrep firewalld; then
+					# Using both permanent and not permanent rules to avoid a firewalld reload.
+					firewall-cmd --zone=public --remove-port=$PORT/udp
+					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
+					firewall-cmd --permanent --zone=public --remove-port=$PORT/udp
+					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
+				fi
+				if iptables -L | grep -qE 'REJECT|DROP'; then
+					sed -i &quot;/iptables -I INPUT -p udp --dport $PORT -j ACCEPT/d&quot; $RCLOCAL
+					sed -i &quot;/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d&quot; $RCLOCAL
+					sed -i &quot;/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d&quot; $RCLOCAL
+				fi
+				sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 -j SNAT --to /d' $RCLOCAL
+				if hash sestatus 2&gt;/dev/null; then
+					if sestatus | grep &quot;Current mode&quot; | grep -qs &quot;enforcing&quot;; then
+						if [[ &quot;$PORT&quot; != '1194' ]]; then
+							semanage port -d -t openvpn_port_t -p udp $PORT
+						fi
+					fi
+				fi
+				if [[ &quot;$OS&quot; = 'debian' ]]; then
+					apt-get remove --purge -y openvpn openvpn-blacklist
+				else
+					yum remove openvpn -y
+				fi
+				rm -rf /etc/openvpn
+				rm -rf /usr/share/doc/openvpn*
+				echo &quot;&quot;
+				echo &quot;OpenVPN removed!&quot;
+			else
+				echo &quot;&quot;
+				echo &quot;Removal aborted!&quot;
+			fi
+			exit
+			;;
+			4) exit;;
+		esac
+	done
+else
+	clear
+	echo 'Welcome to this quick OpenVPN &quot;road warrior&quot; installer'
+	echo &quot;&quot;
+	# OpenVPN setup and first user creation
+	echo &quot;I need to ask you a few questions before starting the setup&quot;
+	echo &quot;You can leave the default options and just press enter if you are ok with them&quot;
+	echo &quot;&quot;
+	echo &quot;First I need to know the IPv4 address of the network interface you want OpenVPN&quot;
+	echo &quot;listening to.&quot;
+	read -p &quot;IP address: &quot; -e -i $IP IP
+	echo &quot;&quot;
+	echo &quot;What port do you want for OpenVPN?&quot;
+	read -p &quot;Port: &quot; -e -i 1194 PORT
+	echo &quot;&quot;
+	echo &quot;What DNS do you want to use with the VPN?&quot;
+	echo &quot;   1) Current system resolvers&quot;
+	echo &quot;   2) Google&quot;
+	echo &quot;   3) OpenDNS&quot;
+	echo &quot;   4) NTT&quot;
+	echo &quot;   5) Hurricane Electric&quot;
+	echo &quot;   6) Verisign&quot;
+	read -p &quot;DNS [1-6]: &quot; -e -i 1 DNS
+	echo &quot;&quot;
+	echo &quot;Finally, tell me your name for the client cert&quot;
+	echo &quot;Please, use one word only, no special characters&quot;
+	read -p &quot;Client name: &quot; -e -i client CLIENT
+	echo &quot;&quot;
+	echo &quot;Okay, that was all I needed. We are ready to setup your OpenVPN server now&quot;
+	read -n1 -r -p &quot;Press any key to continue...&quot;
+		if [[ &quot;$OS&quot; = 'debian' ]]; then
+		apt-get update
+		apt-get install openvpn iptables openssl ca-certificates -y
+	else
+		# Else, the distro is CentOS
+		yum install epel-release -y
+		yum install openvpn iptables openssl wget ca-certificates -y
+	fi
+	# An old version of easy-rsa was available by default in some openvpn packages
+	if [[ -d /etc/openvpn/easy-rsa/ ]]; then
+		rm -rf /etc/openvpn/easy-rsa/
+	fi
+	# Get easy-rsa
+	wget -O ~/EasyRSA-3.0.1.tgz https://github.com/OpenVPN/easy-rsa/releases/download/3.0.1/EasyRSA-3.0.1.tgz
+	tar xzf ~/EasyRSA-3.0.1.tgz -C ~/
+	mv ~/EasyRSA-3.0.1/ /etc/openvpn/
+	mv /etc/openvpn/EasyRSA-3.0.1/ /etc/openvpn/easy-rsa/
+	chown -R root:root /etc/openvpn/easy-rsa/
+	rm -rf ~/EasyRSA-3.0.1.tgz
+	cd /etc/openvpn/easy-rsa/
+	# Create the PKI, set up the CA, the DH params and the server + client certificates
+	./easyrsa init-pki
+	./easyrsa --batch build-ca nopass
+	./easyrsa gen-dh
+	./easyrsa build-server-full server nopass
+	./easyrsa build-client-full $CLIENT nopass
+	./easyrsa gen-crl
+	openvpn --genkey --secret ta.key
+	# Move the stuff we need
+	cp ta.key pki/ca.crt pki/private/ca.key pki/dh.pem pki/issued/server.crt pki/private/server.key /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn
+	# Generate server.conf
+	echo &quot;port $PORT
+proto udp
+dev tun
+sndbuf 0
+rcvbuf 0
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+topology subnet
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+tls-auth ta.key 0&quot; &gt; /etc/openvpn/server.conf
+	echo 'push &quot;redirect-gateway def1 bypass-dhcp&quot;' &gt;&gt; /etc/openvpn/server.conf
+	# DNS
+	case $DNS in
+		1) 
+		# Obtain the resolvers from resolv.conf and use them for OpenVPN
+		grep -v '#' /etc/resolv.conf | grep 'nameserver' | grep -E -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | while read line; do
+			echo &quot;push \&quot;dhcp-option DNS $line\&quot;&quot; &gt;&gt; /etc/openvpn/server.conf
+		done
+		;;
+		2) 
+		echo 'push &quot;dhcp-option DNS 8.8.8.8&quot;' &gt;&gt; /etc/openvpn/server.conf
+		echo 'push &quot;dhcp-option DNS 8.8.4.4&quot;' &gt;&gt; /etc/openvpn/server.conf
+		;;
+		3)
+		echo 'push &quot;dhcp-option DNS 208.67.222.222&quot;' &gt;&gt; /etc/openvpn/server.conf
+		echo 'push &quot;dhcp-option DNS 208.67.220.220&quot;' &gt;&gt; /etc/openvpn/server.conf
+		;;
+		4) 
+		echo 'push &quot;dhcp-option DNS 129.250.35.250&quot;' &gt;&gt; /etc/openvpn/server.conf
+		echo 'push &quot;dhcp-option DNS 129.250.35.251&quot;' &gt;&gt; /etc/openvpn/server.conf
+		;;
+		5) 
+		echo 'push &quot;dhcp-option DNS 74.82.42.42&quot;' &gt;&gt; /etc/openvpn/server.conf
+		;;
+		6) 
+		echo 'push &quot;dhcp-option DNS 64.6.64.6&quot;' &gt;&gt; /etc/openvpn/server.conf
+		echo 'push &quot;dhcp-option DNS 64.6.65.6&quot;' &gt;&gt; /etc/openvpn/server.conf
+		;;
+	esac
+	echo &quot;keepalive 10 120
+comp-lzo
+persist-key
+persist-tun
+status openvpn-status.log
+verb 3
+crl-verify crl.pem&quot; &gt;&gt; /etc/openvpn/server.conf
+	# Enable net.ipv4.ip_forward for the system
+	if [[ &quot;$OS&quot; = 'debian' ]]; then
+		sed -i 's|#net.ipv4.ip_forward=1|net.ipv4.ip_forward=1|' /etc/sysctl.conf
+	else
+		# CentOS 5 and 6
+		sed -i 's|net.ipv4.ip_forward = 0|net.ipv4.ip_forward = 1|' /etc/sysctl.conf
+		# CentOS 7
+		if ! grep -q &quot;net.ipv4.ip_forward=1&quot; &quot;/etc/sysctl.conf&quot;; then
+			echo 'net.ipv4.ip_forward=1' &gt;&gt; /etc/sysctl.conf
+		fi
+	fi
+	# Avoid an unneeded reboot
+	echo 1 &gt; /proc/sys/net/ipv4/ip_forward
+	# Set NAT for the VPN subnet
+	iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP
+	sed -i &quot;1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j SNAT --to $IP&quot; $RCLOCAL
+	if pgrep firewalld; then
+		# We don't use --add-service=openvpn because that would only work with
+		# the default port. Using both permanent and not permanent rules to
+		# avoid a firewalld reload.
+		firewall-cmd --zone=public --add-port=$PORT/udp
+		firewall-cmd --zone=trusted --add-source=10.8.0.0/24
+		firewall-cmd --permanent --zone=public --add-port=$PORT/udp
+		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
+	fi
+	if iptables -L | grep -qE 'REJECT|DROP'; then
+		# If iptables has at least one REJECT rule, we asume this is needed.
+		# Not the best approach but I can't think of other and this shouldn't
+		# cause problems.
+		iptables -I INPUT -p udp --dport $PORT -j ACCEPT
+		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
+		iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+		sed -i &quot;1 a\iptables -I INPUT -p udp --dport $PORT -j ACCEPT&quot; $RCLOCAL
+		sed -i &quot;1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT&quot; $RCLOCAL
+		sed -i &quot;1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT&quot; $RCLOCAL
+	fi
+	# If SELinux is enabled and a custom port was selected, we need this
+	if hash sestatus 2&gt;/dev/null; then
+		if sestatus | grep &quot;Current mode&quot; | grep -qs &quot;enforcing&quot;; then
+			if [[ &quot;$PORT&quot; != '1194' ]]; then
+				# semanage isn't available in CentOS 6 by default
+				if ! hash semanage 2&gt;/dev/null; then
+					yum install policycoreutils-python -y
+				fi
+				semanage port -a -t openvpn_port_t -p udp $PORT
+			fi
+		fi
+	fi
+	# And finally, restart OpenVPN
+	if [[ &quot;$OS&quot; = 'debian' ]]; then
+		# Little hack to check for systemd
+		if pgrep systemd-journal; then
+			systemctl restart openvpn@server.service
+		else
+			/etc/init.d/openvpn restart
+		fi
+	else
+		if pgrep systemd-journal; then
+			systemctl restart openvpn@server.service
+			systemctl enable openvpn@server.service
+		else
+			service openvpn restart
+			chkconfig openvpn on
+		fi
+	fi
+	# Try to detect a NATed connection and ask about it to potential LowEndSpirit users
+	EXTERNALIP=$(wget -qO- ipv4.icanhazip.com)
+	if [[ &quot;$IP&quot; != &quot;$EXTERNALIP&quot; ]]; then
+		echo &quot;&quot;
+		echo &quot;Looks like your server is behind a NAT!&quot;
+		echo &quot;&quot;
+		echo &quot;If your server is NATed (e.g. LowEndSpirit), I need to know the external IP&quot;
+		echo &quot;If that's not the case, just ignore this and leave the next field blank&quot;
+		read -p &quot;External IP: &quot; -e USEREXTERNALIP
+		if [[ &quot;$USEREXTERNALIP&quot; != &quot;&quot; ]]; then
+			IP=$USEREXTERNALIP
+		fi
+	fi
+	# client-common.txt is created so we have a template to add further users later
+	echo &quot;client
+dev tun
+proto udp
+sndbuf 0
+rcvbuf 0
+remote $IP $PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+comp-lzo
+verb 3
+key-direction 1&quot; &gt; /etc/openvpn/client-common.txt
+	# Generates the custom client.ovpn
+	newclient &quot;$CLIENT&quot;
+	echo &quot;&quot;
+	echo &quot;Finished!&quot;
+	echo &quot;&quot;
+	echo &quot;Your client config is available at ~/$CLIENT.ovpn&quot;
+	echo &quot;If you want to add more clients, you simply need to run this script another time!&quot;
+fi</pre>
+
+<!-- load ace -->
+<script src="file:///android_asset/src-noconflict/ace.js"></script>
+<!-- load ace language tools -->
+<script src="file:///android_asset/src-noconflict/ext-language_tools.js"></script>
+<script>
+    // trigger extension
+    ace.require("ace/ext/language_tools");
+    var editor = ace.edit("editor");
+    editor.session.setMode("ace/mode/c_cpp");
+    editor.setShowPrintMargin(false);
+    editor.getSession().setUseWrapMode(true);
+    var code = editor.getValue();
+    //editor.setValue("new code " + code);
+    //enable autocompletion and snippets
+    editor.setOptions({
+        enableBasicAutocompletion: true,
+        enableSnippets: true,
+        enableLiveAutocompletion: true
+    });
+</script>
+</body>
+</html>
